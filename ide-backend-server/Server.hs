@@ -5,28 +5,31 @@ module Server (ghcServer) where
 
 import Prelude hiding (mod, span)
 import Control.Concurrent (ThreadId, throwTo, forkIO, myThreadId, threadDelay)
-import Control.Concurrent.Async (async)
+import Control.Concurrent.Async (async, race)
 import Control.Concurrent.MVar (MVar, newEmptyMVar)
-import Control.Monad (void, unless, when)
+import Control.Monad (void, unless, when, forever)
 import Control.Monad.State (StateT, runStateT)
 import Control.Monad.Trans.Class (lift)
 import Data.Accessor (accessor, (.>))
 import Data.Accessor.Monad.MTL.State (set)
-import Data.Function (on)
-import Foreign.Ptr (Ptr, nullPtr)
+import Data.Function (on, fix)
 import Foreign.C.Types (CFile)
-import System.Environment (withArgs, getEnvironment)
+import Foreign.Ptr (Ptr, nullPtr)
+import System.Environment (withArgs, getEnvironment, setEnv)
 import System.FilePath ((</>))
 import System.IO (Handle, hFlush, hClose)
 import System.IO.Temp (createTempDirectory, openTempFile)
 import System.Mem (performGC)
-import System.Posix (Fd)
+import System.Posix (Fd, createSession)
 import System.Posix.IO
 import System.Posix.Files (createNamedPipe)
 import System.Posix.Process (forkProcess, getProcessStatus)
+import System.Posix.Terminal (openPseudoTerminal)
+import System.Posix.Signals (signalProcess, sigKILL, sigTERM)
+import qualified Posix
 import System.Posix.Types (ProcessID)
 import qualified Control.Exception as Ex
-import qualified Data.ByteString   as BSS (hGetSome, hPut, null)
+import qualified Data.ByteString   as BSS
 import qualified Data.List         as List
 import qualified Data.Text         as Text
 import qualified System.Directory  as Dir
@@ -115,11 +118,20 @@ ghcServerEngine errorLog conv@RpcConversation{..} = do
                 conv pluginRef importsRef errsRef sourceDir
                 genCode targets configGenerateModInfo
               return args
-            ReqRun runCmd -> do
-              (pid, stdin, stdout, errorLog') <- startConcurrentConversation sessionDir $ \_errorLog' conv' -> do
-                 ghcWithArgs args $ ghcHandleRun conv' runCmd
-              liftIO $ put (pid, stdin, stdout, errorLog')
-              return args
+            ReqRun runCmd
+              | runCmdPty runCmd -> do
+                fds <- liftIO openPseudoTerminal
+                conversationTuple <- startConcurrentConversation sessionDir $ \_ _ _ ->
+                  ghcWithArgs args $ ghcHandleRunPtySlave fds runCmd
+                liftIO $ runPtyMaster fds conversationTuple
+                liftIO $ put conversationTuple
+                return args
+              | otherwise -> do
+                conversationTuple <- startConcurrentConversation sessionDir $
+                  ghcConcurrentConversation $ \_errorLog' conv' ->
+                    ghcWithArgs args $ ghcHandleRun conv' runCmd
+                liftIO $ put conversationTuple
+                return args
             ReqSetEnv env -> do
               ghcHandleSetEnv conv initEnv env
               return args
@@ -217,8 +229,11 @@ initSession distDir modInfo dOpts errsRef stRef pluginRef callback = do
 #endif
       }
 
-startConcurrentConversation :: FilePath -> (FilePath -> RpcConversation -> Ghc ()) -> Ghc (ProcessID, FilePath, FilePath, FilePath)
-startConcurrentConversation sessionDir server = do
+startConcurrentConversation
+  :: FilePath
+  -> (FilePath -> FilePath -> FilePath -> Ghc ())
+  -> Ghc (ProcessID, FilePath, FilePath, FilePath)
+startConcurrentConversation sessionDir inner = do
   -- Ideally, we'd have the child process create the temp directory and
   -- communicate the name back to us, so that the child process can remove the
   -- directories again when it's done with it. However, this means we need some
@@ -244,13 +259,14 @@ startConcurrentConversation sessionDir server = do
   -- because we need to change global state in the child process; in particular,
   -- we need to redirect stdin, stdout, and stderr (as well as some other global
   -- state, including withArgs).
-  liftIO $ performGC
-  processId <- forkGhcProcess $ ghcConcurrentConversation stdin stdout errorLog server
+  liftIO performGC
+  processId <- forkGhcProcess $ inner stdin stdout errorLog
 
   -- We wait for the process to finish in a separate thread so that we do not
   -- accumulate zombies
-  liftIO $ void $ forkIO $
+  liftIO $ void $ forkIO $ do
     void $ getProcessStatus True False processId
+    putStrLn "Process finished"
 
   return (processId, stdin, stdout, errorLog)
 
@@ -516,6 +532,63 @@ ghcHandleUnload RpcConversation{..} objects = liftIO $ do
   mapM_ ObjLink.unloadObj objects
   put ()
 
+runPtyMaster :: (Fd, Fd) -> (ProcessID, FilePath, FilePath, FilePath) -> IO ()
+runPtyMaster (masterFd, slaveFd) (processId, stdin, stdout, errorLog) = do
+  -- Since we're in the master process, close the slave FD.
+  closeFd slaveFd
+  -- FIXME: ensure these threads get killed.
+  let readOutput :: RpcConversation -> IO ()
+      readOutput conv = printExceptions "readOutput" $ fix $ \loop -> do
+        putStrLn "Waiting for output"
+        bs <- printExceptions "readOutput readChunk" $ Posix.readChunk masterFd
+        if BSS.null bs
+          then putStrLn "Output finished"
+          else do
+            putStrLn $ "Got output: " ++ show bs
+            put conv (GhcRunOutp bs)
+            putStrLn "Sent output"
+            loop
+      handleRequests :: RpcConversation -> IO ()
+      handleRequests conv = printExceptions "handleRequests" $ forever $ do
+        putStrLn "Waiting for input"
+        request <- printExceptions "handleRequests get" $ get conv
+        case request of
+          GhcRunInput bs -> do
+            putStrLn $ "Got input: " ++ show bs
+            Posix.write masterFd bs
+          -- Fork a new thread because this could throw exceptions.
+          GhcRunInterrupt -> void $ forkIO $ signalProcess sigTERM processId
+  void $ forkIO $ printExceptions "concurrent conversation" $
+    concurrentConversation stdin stdout errorLog $ \_ conv ->
+      printExceptions "process race" $ do
+        eres <- readOutput conv `race` handleRequests conv
+        print ("race exited with", eres)
+
+printExceptions :: String -> IO a -> IO a
+printExceptions msg f = f `Ex.catch` \ex -> do
+  print (msg, ex :: Ex.SomeException)
+  Ex.throwIO ex
+
+ghcHandleRunPtySlave :: (Fd, Fd) -> RunCmd -> Ghc ()
+ghcHandleRunPtySlave (masterFd, slaveFd) runCmd = do
+  liftIO $ do
+    -- Since we're in the slave process, close the master FD.
+    closeFd masterFd
+    -- Create a new session with a controlling terminal.
+    void createSession
+    Posix.setControllingTerminal slaveFd
+    -- Redirect standard IO to the terminal FD.
+    void $ dupTo slaveFd stdInput
+    void $ dupTo slaveFd stdOutput
+    void $ dupTo slaveFd stdError
+    -- FIXME: plush shell does this but I'm not sure why.
+    closeFd slaveFd
+    -- Set TERM env variable
+    setEnv "TERM" "xterm-256color"
+  --FIXME: do something about the run result.
+  result <- runInGhc runCmd
+  return ()
+
 -- | Handle a run request
 ghcHandleRun :: RpcConversation -> RunCmd -> Ghc ()
 ghcHandleRun RpcConversation{..} runCmd = do
@@ -706,10 +779,10 @@ forkGhcProcess :: Ghc () -> Ghc ProcessID
 forkGhcProcess = unsafeLiftIO forkProcess
 
 -- | Lifted version of concurrentConversation
-ghcConcurrentConversation :: FilePath
+ghcConcurrentConversation :: (FilePath -> RpcConversation -> Ghc ())
                           -> FilePath
                           -> FilePath
-                          -> (FilePath -> RpcConversation -> Ghc ())
+                          -> FilePath
                           -> Ghc ()
-ghcConcurrentConversation requestR responseW errorLog =
-  unsafeLiftIO2 (concurrentConversation requestR responseW errorLog)
+ghcConcurrentConversation f requestR responseW errorLog =
+  unsafeLiftIO2 (concurrentConversation requestR responseW errorLog) f

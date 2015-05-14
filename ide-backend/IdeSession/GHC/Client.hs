@@ -269,7 +269,7 @@ rpcRun server cmd translateResult =
             --
             -- (TODO: What happens when an exception happens in the reqThread?)
             withAsync (sendRequests put reqChan) $ \_reqThread -> do
-              let go = do resp <- get
+              let go = do resp <- printExceptions "reqThread get" get
                           case resp of
                             GhcRunDone result -> do
                               ignoreIOExceptions $ removeFile errorLog
@@ -359,3 +359,8 @@ ignoreIOExceptions :: IO () -> IO ()
 ignoreIOExceptions = let handler :: Ex.IOException -> IO ()
                          handler _ = return ()
                      in Ex.handle handler
+
+printExceptions :: String -> IO a -> IO a
+printExceptions msg f = f `Ex.catch` \ex -> do
+  print (msg, ex :: Ex.SomeException)
+  Ex.throwIO ex
