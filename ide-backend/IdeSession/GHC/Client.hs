@@ -269,7 +269,7 @@ rpcRun server cmd translateResult =
             --
             -- (TODO: What happens when an exception happens in the reqThread?)
             withAsync (sendRequests put reqChan) $ \_reqThread -> do
-              let go = do resp <- printExceptions "reqThread get" get
+              let go = do resp <- get
                           case resp of
                             GhcRunDone result -> do
                               ignoreIOExceptions $ removeFile errorLog
@@ -311,7 +311,7 @@ rpcRun server cmd translateResult =
         }
 
     sendRequests :: (GhcRunRequest -> IO ()) -> Chan GhcRunRequest -> IO ()
-    sendRequests put reqChan = forever $ put =<< $readChan reqChan
+    sendRequests put reqChan = printExceptions "sendRequests" $ forever $ put =<< $readChan reqChan
 
     -- TODO: should we restart the session when ghc crashes?
     -- Maybe recommend that the session is started on GhcExceptions?

@@ -5,7 +5,7 @@ module Server (ghcServer) where
 
 import Prelude hiding (mod, span)
 import Control.Concurrent (ThreadId, throwTo, forkIO, myThreadId, threadDelay)
-import Control.Concurrent.Async (async, race)
+import Control.Concurrent.Async (async, withAsync)
 import Control.Concurrent.MVar (MVar, newEmptyMVar)
 import Control.Monad (void, unless, when, forever)
 import Control.Monad.State (StateT, runStateT)
@@ -15,6 +15,7 @@ import Data.Accessor.Monad.MTL.State (set)
 import Data.Function (on, fix)
 import Foreign.C.Types (CFile)
 import Foreign.Ptr (Ptr, nullPtr)
+import GHC.IO.Exception (IOException(..), IOErrorType(..))
 import System.Environment (withArgs, getEnvironment, setEnv)
 import System.FilePath ((</>))
 import System.IO (Handle, hFlush, hClose)
@@ -264,9 +265,11 @@ startConcurrentConversation sessionDir inner = do
 
   -- We wait for the process to finish in a separate thread so that we do not
   -- accumulate zombies
-  liftIO $ void $ forkIO $ do
+  --
+  -- FIXME(mgs): I didn't write this, and I'm not sure I see the point
+  -- of doing this.
+  liftIO $ void $ forkIO $
     void $ getProcessStatus True False processId
-    putStrLn "Process finished"
 
   return (processId, stdin, stdout, errorLog)
 
@@ -536,38 +539,35 @@ runPtyMaster :: (Fd, Fd) -> (ProcessID, FilePath, FilePath, FilePath) -> IO ()
 runPtyMaster (masterFd, slaveFd) (processId, stdin, stdout, errorLog) = do
   -- Since we're in the master process, close the slave FD.
   closeFd slaveFd
-  -- FIXME: ensure these threads get killed.
-  let readOutput :: RpcConversation -> IO ()
-      readOutput conv = printExceptions "readOutput" $ fix $ \loop -> do
-        putStrLn "Waiting for output"
-        bs <- printExceptions "readOutput readChunk" $ Posix.readChunk masterFd
+  let readOutput :: RpcConversation -> IO RunResult
+      readOutput conv = fix $ \loop -> do
+        bs <- Posix.readChunk masterFd `Ex.catch` \ex ->
+          -- Ignore HardwareFaults as they seem to always happen when
+          -- process exits..
+          if ioe_type ex == HardwareFault
+            then return BSS.empty
+            else Ex.throwIO ex
         if BSS.null bs
-          then putStrLn "Output finished"
+          then return RunOk
           else do
-            putStrLn $ "Got output: " ++ show bs
             put conv (GhcRunOutp bs)
-            putStrLn "Sent output"
             loop
       handleRequests :: RpcConversation -> IO ()
-      handleRequests conv = printExceptions "handleRequests" $ forever $ do
-        putStrLn "Waiting for input"
-        request <- printExceptions "handleRequests get" $ get conv
+      handleRequests conv = forever $ do
+        request <- get conv
         case request of
-          GhcRunInput bs -> do
-            putStrLn $ "Got input: " ++ show bs
-            Posix.write masterFd bs
+          GhcRunInput bs -> Posix.write masterFd bs
           -- Fork a new thread because this could throw exceptions.
           GhcRunInterrupt -> void $ forkIO $ signalProcess sigTERM processId
-  void $ forkIO $ printExceptions "concurrent conversation" $
-    concurrentConversation stdin stdout errorLog $ \_ conv ->
-      printExceptions "process race" $ do
-        eres <- readOutput conv `race` handleRequests conv
-        print ("race exited with", eres)
-
-printExceptions :: String -> IO a -> IO a
-printExceptions msg f = f `Ex.catch` \ex -> do
-  print (msg, ex :: Ex.SomeException)
-  Ex.throwIO ex
+      -- Turn a GHC exception into a RunResult
+      ghcException :: GhcException -> IO RunResult
+      ghcException = return . RunGhcException . show
+  void $ forkIO $
+    concurrentConversation stdin stdout errorLog $ \_ conv -> do
+      result <- Ex.handle ghcException $
+        withAsync (handleRequests conv) $ \_ ->
+        readOutput conv
+      put conv (GhcRunDone result)
 
 ghcHandleRunPtySlave :: (Fd, Fd) -> RunCmd -> Ghc ()
 ghcHandleRunPtySlave (masterFd, slaveFd) runCmd = do
@@ -581,13 +581,18 @@ ghcHandleRunPtySlave (masterFd, slaveFd) runCmd = do
     void $ dupTo slaveFd stdInput
     void $ dupTo slaveFd stdOutput
     void $ dupTo slaveFd stdError
-    -- FIXME: plush shell does this but I'm not sure why.
     closeFd slaveFd
     -- Set TERM env variable
     setEnv "TERM" "xterm-256color"
-  --FIXME: do something about the run result.
+  --FIXME: Properly pass the run result to the client as a GhcRunDone
+  --value. Instead, we write it to standard output, which gets sent to
+  --the terminal.
   result <- runInGhc runCmd
-  return ()
+  case result of
+    -- A successful result will be sent by runPtyMaster - only send
+    -- failures.
+    RunOk -> return ()
+    _ -> liftIO $ putStrLn $ "\r\nProcess done: " ++ show result ++ "\r\n"
 
 -- | Handle a run request
 ghcHandleRun :: RpcConversation -> RunCmd -> Ghc ()
